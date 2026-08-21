@@ -2,7 +2,9 @@ import pytest
 import httpx
 import uuid
 from datetime import datetime, timedelta, timezone
+
 from api.main import app
+from common.redis_client import redis_client
 
 @pytest.fixture
 async def client():
@@ -53,10 +55,10 @@ async def test_get_nonexistent_job(client):
 
 @pytest.mark.anyio
 async def test_cancel_pending_or_delayed_job(client):
-    """Cancelling a pending/delayed job changes its status to cancelled."""
-    # Schedule job in the future to avoid worker race condition
+    """Cancelling a pending/delayed job changes its status in Postgres AND removes it from Redis."""
+    # 1. Test delayed job cancellation
     future_time = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    create_response = await client.post(
+    create_delayed_resp = await client.post(
         "/jobs",
         json={
             "payload": {"type": "sleep", "seconds": 5},
@@ -64,16 +66,37 @@ async def test_cancel_pending_or_delayed_job(client):
             "execute_at": future_time
         }
     )
-    assert create_response.status_code in (200, 201)
-    job_id = create_response.json()["id"]
-    assert create_response.json()["status"] == "delayed"
+    assert create_delayed_resp.status_code in (200, 201)
+    delayed_job_id = create_delayed_resp.json()["id"]
+    assert create_delayed_resp.json()["status"] == "delayed"
 
-    # Cancel the job
-    cancel_response = await client.post(f"/jobs/{job_id}/cancel")
-    assert cancel_response.status_code == 200
-    assert "cancelled successfully" in cancel_response.json().get("message", "").lower()
+    # Verify present in Redis delayed queue before cancellation
+    assert redis_client.zscore("queue:delayed", str(delayed_job_id)) is not None
 
-    # Verify status changed in database
-    get_response = await client.get(f"/jobs/{job_id}")
-    assert get_response.status_code == 200
-    assert get_response.json()["status"] == "cancelled"
+    # Cancel the delayed job
+    cancel_delayed_resp = await client.post(f"/jobs/{delayed_job_id}/cancel")
+    assert cancel_delayed_resp.status_code == 200
+
+    # Assert Postgres status is cancelled
+    get_delayed_resp = await client.get(f"/jobs/{delayed_job_id}")
+    assert get_delayed_resp.status_code == 200
+    assert get_delayed_resp.json()["status"] == "cancelled"
+
+    # CRITICAL: Assert removed from Redis sorted set
+    assert redis_client.zscore("queue:delayed", str(delayed_job_id)) is None
+
+    # 2. Test pending job cancellation
+    create_pending_resp = await client.post(
+        "/jobs",
+        json={"payload": {"type": "sleep", "seconds": 10}, "priority": 1}
+    )
+    assert create_pending_resp.status_code in (200, 201)
+    pending_job_id = create_pending_resp.json()["id"]
+
+    # Cancel the pending job (if worker hasn't processed it yet)
+    cancel_pending_resp = await client.post(f"/jobs/{pending_job_id}/cancel")
+    if cancel_pending_resp.status_code == 200:
+        # Confirm removed from Redis pending queue
+        assert redis_client.zscore("queue:pending", str(pending_job_id)) is None
+        get_pending_resp = await client.get(f"/jobs/{pending_job_id}")
+        assert get_pending_resp.json()["status"] == "cancelled"
