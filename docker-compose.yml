@@ -1,26 +1,36 @@
-# This docker-compose file defines the core infrastructure services for QueueForge.
-# - The "redis" service provides the in-memory data store used for priority queues and delayed job execution.
-# - The "postgres" service acts as the primary relational database for persistent metadata, worker state, and monitoring.
-# Healthchecks are included for both services to ensure they are fully initialized and ready to accept connections before dependent services (like the API or workers) attempt to start and connect to them.
-
-version: '3.8'
+# ==============================================================================
+# QueueForge Distributed Job Orchestration Stack
+#
+# To build and launch the complete stack with 3 scaled worker containers:
+#   docker compose up --build --scale worker=3
+#
+# Services:
+#   - postgres   : Relational storage for job status, attempts, metadata & heartbeats
+#   - redis      : Low-latency sorted sets (priority & delayed queues) & Pub/Sub
+#   - api        : FastAPI REST & WebSocket telemetry gateway (port 8000)
+#   - worker     : Concurrent distributed execution daemon (scaled to 3 replicas)
+#   - reaper     : Crash-recovery daemon for orphaned jobs and dead workers (1 replica)
+#   - dashboard  : Real-time Next.js Ops Console (port 3000)
+# ==============================================================================
 
 services:
   redis:
     image: redis:7-alpine
+    container_name: queueforge-redis
     ports:
       - "6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
-      start_period: 5s
+      start_period: 3s
 
   postgres:
     image: postgres:16-alpine
+    container_name: queueforge-postgres
     ports:
       - "5433:5432"
     environment:
@@ -30,11 +40,78 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-queueforge_user} -d $${POSTGRES_DB:-queueforge_db}"]
+      interval: 5s
+      timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: queueforge-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-queueforge_user}:${POSTGRES_PASSWORD:-queueforge_pass}@postgres:5432/${POSTGRES_DB:-queueforge_db}
+      REDIS_URL: redis://redis:6379/0
+      PORT: 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-queueforge_user}:${POSTGRES_PASSWORD:-queueforge_pass}@postgres:5432/${POSTGRES_DB:-queueforge_db}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+
+  reaper:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: queueforge-reaper
+    command: ["python", "worker/reaper.py"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-queueforge_user}:${POSTGRES_PASSWORD:-queueforge_pass}@postgres:5432/${POSTGRES_DB:-queueforge_db}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    container_name: queueforge-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    depends_on:
+      - api
+    restart: unless-stopped
 
 volumes:
   redis_data:
