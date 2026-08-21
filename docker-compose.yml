@@ -1,0 +1,41 @@
+# This docker-compose file defines the core infrastructure services for QueueForge.
+# - The "redis" service provides the in-memory data store used for priority queues and delayed job execution.
+# - The "postgres" service acts as the primary relational database for persistent metadata, worker state, and monitoring.
+# Healthchecks are included for both services to ensure they are fully initialized and ready to accept connections before dependent services (like the API or workers) attempt to start and connect to them.
+
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-queueforge_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queueforge_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-queueforge_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  redis_data:
+  postgres_data:
