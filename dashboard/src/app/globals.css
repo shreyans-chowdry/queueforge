@@ -1,19 +1,57 @@
 @import "tailwindcss";
 
-@theme {
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+@layer base {
+  * {
+    border-color: #2A2F3A;
+  }
+
+  body {
+    background-color: #14171C;
+    color: #E4E6EB;
+    font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
 }
 
-:root {
-  --background: #020617;
-  --foreground: #f8fafc;
+/* Flash animation on WebSocket row update (< 400ms) */
+@keyframes rowFlashAnim {
+  0% {
+    background-color: rgba(76, 141, 255, 0.28);
+  }
+  100% {
+    background-color: transparent;
+  }
 }
 
-body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+.animate-row-flash {
+  animation: rowFlashAnim 380ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-row-flash {
+    animation: none !important;
+  }
+  .animate-ping {
+    animation: none !important;
+  }
+}
+
+/* Subtle scrollbars for data console */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #14171C;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2A2F3A;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3B4252;
 }
