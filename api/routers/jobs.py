@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from common.db import get_db
@@ -18,6 +18,8 @@ class JobCreate(BaseModel):
     execute_at: Optional[datetime] = None
 
 class JobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     payload: Dict[str, Any]
     priority: int
@@ -32,13 +34,22 @@ class JobResponse(BaseModel):
     result: Optional[Dict[str, Any]]
     error: Optional[str]
 
-    class Config:
-        from_attributes = True
-
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 def create_job(job_in: JobCreate, db: Session = Depends(get_db)):
     # Determine initial status based on execute_at
-    initial_status = JobStatus.delayed if job_in.execute_at and job_in.execute_at > datetime.utcnow() else JobStatus.pending
+    is_delayed = False
+    execute_at_ms = None
+    
+    if job_in.execute_at:
+        exec_time = job_in.execute_at
+        now_time = datetime.now(timezone.utc)
+        if exec_time.tzinfo is None:
+            exec_time = exec_time.replace(tzinfo=timezone.utc)
+        if exec_time > now_time:
+            is_delayed = True
+        execute_at_ms = int(exec_time.timestamp() * 1000)
+    
+    initial_status = JobStatus.delayed if is_delayed else JobStatus.pending
     
     # Create Job in Postgres
     new_job = Job(
@@ -52,7 +63,6 @@ def create_job(job_in: JobCreate, db: Session = Depends(get_db)):
     db.refresh(new_job)
     
     # Enqueue in Redis
-    execute_at_ms = int(job_in.execute_at.timestamp() * 1000) if job_in.execute_at else None
     enqueue(str(new_job.id), new_job.priority, execute_at_ms)
     
     return new_job

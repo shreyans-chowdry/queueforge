@@ -7,3 +7,6 @@ psycopg2-binary
 alembic
 redis
 python-dotenv
+websockets
+httpx
+pytest
