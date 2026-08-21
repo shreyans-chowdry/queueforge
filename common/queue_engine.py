@@ -92,3 +92,22 @@ def publish_job_event(job_id: str, status: str):
     """
     message = json.dumps({"job_id": job_id, "status": status})
     redis_client.publish("job_events", message)
+
+def update_worker_registry(worker_id: str, status: str, current_job_id: str = None):
+    """
+    Updates the worker's heartbeat in the 'workers:registry' hash.
+    Used by workers to signal they are alive, and by the reaper to detect dead workers.
+    """
+    payload = {
+        "last_seen": get_now_ms(),
+        "status": status,
+        "current_job_id": current_job_id
+    }
+    redis_client.hset("workers:registry", worker_id, json.dumps(payload))
+
+def get_all_workers():
+    """
+    Retrieves the entire worker registry.
+    """
+    workers = redis_client.hgetall("workers:registry")
+    return {k: json.loads(v) for k, v in workers.items()}
