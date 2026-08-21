@@ -14,6 +14,7 @@ class JobStatus(enum.Enum):
     completed = "completed"      # Job finished executing successfully
     failed = "failed"            # Job encountered an error but may be retried
     dead_letter = "dead_letter"  # Job exceeded max retries and will not be attempted again
+    cancelled = "cancelled"      # Job was explicitly cancelled
 
 class WorkerStatus(enum.Enum):
     alive = "alive"  # Worker is actively sending heartbeats
