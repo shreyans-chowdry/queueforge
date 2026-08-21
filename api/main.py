@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from api.routers import jobs
+from api.routers import jobs, workers
 from api.websocket import router as ws_router, pubsub_listener
 from common.db import get_db
 from common.redis_client import redis_client
@@ -23,8 +24,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="QueueForge API", lifespan=lifespan)
 
+# Allow CORS for the dashboard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(jobs.router)
 app.include_router(ws_router)
+app.include_router(workers.router)
 
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
