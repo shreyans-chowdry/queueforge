@@ -1,13 +1,50 @@
 import time
 import json
 import random
+from typing import Optional, Dict, Any, List
 from common.redis_client import redis_client
+
+# Atomic Lua script for dequeue:
+# Pops the highest priority job from queue:pending and atomically registers it
+# into queue:processing:{worker_id} with visibility lease score.
+LUA_DEQUEUE = """
+local item = redis.call('ZPOPMIN', KEYS[1], 1)
+if item and #item > 0 then
+    local job_id = item[1]
+    redis.call('ZADD', KEYS[2], ARGV[1], job_id)
+    return job_id
+end
+return nil
+"""
+
+# Atomic Lua script for delayed job promotion:
+# Checks queue:delayed for mature jobs (score <= now). Atomically removes from
+# queue:delayed and adds to queue:pending, retrieving preserved priority from jobs:priority.
+# Guarantees that even with scaled workers, exactly one worker promotes each job.
+LUA_PROMOTE_DELAYED = """
+local due_jobs = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, 100)
+local promoted = 0
+for _, job_id in ipairs(due_jobs) do
+    local removed = redis.call('ZREM', KEYS[1], job_id)
+    if removed == 1 then
+        local prio_str = redis.call('HGET', KEYS[3], job_id)
+        local priority = 5
+        if prio_str then
+            priority = tonumber(prio_str)
+        end
+        local score = (10 - priority) * 10000000000000 + tonumber(ARGV[1])
+        redis.call('ZADD', KEYS[2], score, job_id)
+        promoted = promoted + 1
+    end
+end
+return promoted
+"""
 
 def get_now_ms() -> int:
     """Returns the current time in milliseconds since the epoch."""
     return int(time.time() * 1000)
 
-def enqueue(job_id: str, priority: int, execute_at: int = None):
+def enqueue(job_id: str, priority: int = 5, execute_at: int = None):
     """
     Adds a job to the queue.
     If `execute_at` is in the future, the job goes into 'queue:delayed'.
@@ -16,52 +53,57 @@ def enqueue(job_id: str, priority: int, execute_at: int = None):
     Score formula: (10 - priority) * 10**13 + enqueued_at_epoch_ms
     """
     now = get_now_ms()
+    # Retain priority in hash so delayed promotions & retries preserve original priority
+    redis_client.hset("jobs:priority", job_id, priority)
+    
     if execute_at and execute_at > now:
         redis_client.zadd("queue:delayed", {job_id: execute_at})
     else:
         score = (10 - priority) * (10**13) + now
         redis_client.zadd("queue:pending", {job_id: score})
 
-def promote_due_delayed_jobs():
+def promote_due_delayed_jobs() -> int:
     """
-    Moves jobs from 'queue:delayed' to 'queue:pending' if their scheduled time has arrived.
-    This acts as a scheduler mechanism to activate delayed or retried jobs into the active queue.
+    Atomically moves jobs from 'queue:delayed' to 'queue:pending' if their scheduled time has arrived.
+    Uses Lua to ensure exactly-once promotion across distributed workers and restores configured priority.
     """
     now = get_now_ms()
-    # Fetch all jobs whose execution time is <= now
-    due_jobs = redis_client.zrangebyscore("queue:delayed", 0, now)
-    
-    if due_jobs:
-        pipe = redis_client.pipeline()
-        for job_id in due_jobs:
-            pipe.zrem("queue:delayed", job_id)
-            # Default priority of 5 is used here since we only have the job_id.
-            # In a full system, we might query the DB or store the priority in a hash.
-            score = (10 - 5) * (10**13) + now
-            pipe.zadd("queue:pending", {job_id: score})
-        pipe.execute()
+    promoted = redis_client.eval(
+        LUA_PROMOTE_DELAYED, 
+        3, 
+        "queue:delayed", 
+        "queue:pending", 
+        "jobs:priority", 
+        now
+    )
+    return int(promoted or 0)
 
-def dequeue(worker_id: str, visibility_timeout_ms: int):
+def dequeue(worker_id: str, visibility_timeout_ms: int) -> Optional[str]:
     """
-    Fetches the highest priority job (lowest score) from 'queue:pending' using ZPOPMIN.
-    Moves it to 'queue:processing:{worker_id}' with a visibility timeout score so that 
-    crashed workers can be detected and their jobs recovered.
+    Atomically fetches the highest priority job from 'queue:pending' and transfers it
+    to 'queue:processing:{worker_id}' with a visibility timeout score.
+    Prevents job loss if a worker crashes immediately after claiming.
     """
-    result = redis_client.zpopmin("queue:pending")
-    if result:
-        job_id = result[0][0]
-        now = get_now_ms()
-        score = now + visibility_timeout_ms
-        redis_client.zadd(f"queue:processing:{worker_id}", {job_id: score})
-        return job_id
-    return None
+    now = get_now_ms()
+    score = now + visibility_timeout_ms
+    job_id = redis_client.eval(
+        LUA_DEQUEUE,
+        2,
+        "queue:pending",
+        f"queue:processing:{worker_id}",
+        score
+    )
+    return str(job_id) if job_id else None
 
 def ack(job_id: str, worker_id: str):
     """
-    Removes the job from the worker's processing queue.
+    Removes the job from the worker's processing queue and cleans up priority tracking.
     Called when a job completes successfully so it is not processed again or recovered.
     """
-    redis_client.zrem(f"queue:processing:{worker_id}", job_id)
+    pipe = redis_client.pipeline()
+    pipe.zrem(f"queue:processing:{worker_id}", job_id)
+    pipe.hdel("jobs:priority", job_id)
+    pipe.execute()
 
 def requeue_with_backoff(job_id: str, worker_id: str, attempt: int, base_delay_ms: int = 1000, max_delay_ms: int = 60000):
     """
@@ -82,15 +124,42 @@ def move_to_dead_letter(job_id: str, worker_id: str):
     Removes the job from the processing queue and adds it to the dead letter queue (DLQ).
     Used when a job has exhausted all retries so developers can inspect the persistently failing job later.
     """
-    redis_client.zrem(f"queue:processing:{worker_id}", job_id)
-    redis_client.rpush("queue:dead_letter", job_id)
+    pipe = redis_client.pipeline()
+    pipe.zrem(f"queue:processing:{worker_id}", job_id)
+    pipe.rpush("queue:dead_letter", job_id)
+    pipe.execute()
 
-def publish_job_event(job_id: str, status: str):
+def redrive_dead_letter(job_id: str, priority: int = 5):
+    """
+    Re-enqueues a job from the dead letter queue back into the active pending queue.
+    """
+    redis_client.lrem("queue:dead_letter", 0, job_id)
+    enqueue(job_id, priority=priority)
+
+def get_dlq_jobs(start: int = 0, stop: int = -1) -> List[str]:
+    """Returns job IDs currently residing in the dead letter queue."""
+    return redis_client.lrange("queue:dead_letter", start, stop)
+
+def publish_job_event(
+    job_id: str, 
+    status: str, 
+    worker_id: Optional[str] = None, 
+    attempts: Optional[int] = None, 
+    error: Optional[str] = None
+):
     """
     Publishes a status update for a job to the 'job_events' Redis channel.
-    This enables real-time monitoring components to react instantly to job state changes.
+    Enriched with worker, attempts, and error details so dashboard clients can
+    update state directly without requiring N+1 GET requests.
     """
-    message = json.dumps({"job_id": job_id, "status": status})
+    message = json.dumps({
+        "job_id": job_id, 
+        "status": status,
+        "worker_id": worker_id,
+        "attempts": attempts,
+        "error": error,
+        "timestamp": get_now_ms()
+    })
     redis_client.publish("job_events", message)
 
 def update_worker_registry(worker_id: str, status: str, current_job_id: str = None):
@@ -105,7 +174,7 @@ def update_worker_registry(worker_id: str, status: str, current_job_id: str = No
     }
     redis_client.hset("workers:registry", worker_id, json.dumps(payload))
 
-def get_all_workers():
+def get_all_workers() -> Dict[str, Any]:
     """
     Retrieves the entire worker registry.
     """

@@ -74,3 +74,45 @@ def test_requeue_with_backoff():
     # Score 1 is roughly Now + 2000-3000ms. Score 2 is roughly Now' + 4000-6000ms.
     # We add 500ms safety buffer to ensure strict increasing logic is verified.
     assert score2 > score1 + 500
+
+def test_delayed_job_priority_preservation():
+    """Verify that delayed jobs preserve their original priority when promoted to pending."""
+    worker_id = "worker_1"
+    now = get_now_ms()
+
+    # Enqueue a regular priority 5 job into pending
+    enqueue("job_normal", priority=5)
+
+    # Enqueue a high-priority delayed job maturing in 50ms
+    future_time = get_now_ms() + 50
+    enqueue("job_urgent_delayed", priority=9, execute_at=future_time)
+    
+    # Wait for the scheduled time to pass
+    time.sleep(0.08)
+
+    # Promote the delayed job
+    promoted = promote_due_delayed_jobs()
+    assert promoted >= 1
+
+    # The urgent promoted job should be dequeued BEFORE the normal priority 5 job
+    first_job = dequeue(worker_id, visibility_timeout_ms=5000)
+    assert first_job == "job_urgent_delayed"
+
+    second_job = dequeue(worker_id, visibility_timeout_ms=5000)
+    assert second_job == "job_normal"
+
+def test_atomic_dequeue_leasing():
+    """Verify dequeue atomically removes from pending and registers lease in processing queue."""
+    worker_id = "worker_lease_test"
+    enqueue("job_to_lease", priority=7)
+
+    claimed_id = dequeue(worker_id, visibility_timeout_ms=15000)
+    assert claimed_id == "job_to_lease"
+
+    # Confirmed removed from pending
+    assert redis_client.zscore("queue:pending", "job_to_lease") is None
+
+    # Confirmed registered in processing queue with future timeout
+    lease_score = redis_client.zscore(f"queue:processing:{worker_id}", "job_to_lease")
+    assert lease_score is not None
+    assert lease_score > get_now_ms() + 10000

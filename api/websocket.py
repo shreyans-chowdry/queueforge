@@ -54,21 +54,35 @@ async def websocket_jobs(websocket: WebSocket):
 
 async def pubsub_listener():
     # Use the asyncio Redis client to avoid blocking the FastAPI event loop
-    redis_conn = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    pubsub = redis_conn.pubsub()
-    await pubsub.subscribe("job_events")
-    
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
+    while True:
+        redis_conn = None
+        pubsub = None
+        try:
+            redis_conn = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            pubsub = redis_conn.pubsub()
+            await pubsub.subscribe("job_events")
+            
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    try:
+                        data = json.loads(message["data"])
+                        await manager.broadcast(data)
+                    except Exception as e:
+                        print(f"Error broadcasting message: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Redis pubsub connection error: {e}. Reconnecting in 2s...")
+            await asyncio.sleep(2)
+        finally:
+            if pubsub:
                 try:
-                    data = json.loads(message["data"])
-                    await manager.broadcast(data)
-                except Exception as e:
-                    print(f"Error broadcasting message: {e}")
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await pubsub.unsubscribe("job_events")
-        await pubsub.close()
-        await redis_conn.aclose()
+                    await pubsub.unsubscribe("job_events")
+                    await pubsub.close()
+                except Exception:
+                    pass
+            if redis_conn:
+                try:
+                    await redis_conn.aclose()
+                except Exception:
+                    pass

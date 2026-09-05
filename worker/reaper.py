@@ -28,8 +28,13 @@ def run_reaper():
             # 1. Scan the registry for workers whose heartbeat has flatlined
             workers = get_all_workers()
             for w_id, w_data in workers.items():
+                last_seen = w_data.get("last_seen", 0)
+                # If dead for more than 1 hour, prune from hash to prevent memory leak
+                if now - last_seen > 3600_000:
+                    redis_client.hdel("workers:registry", w_id)
+                    continue
+
                 if w_data.get("status") == "alive":
-                    last_seen = w_data.get("last_seen", 0)
                     if now - last_seen > 15000:
                         print(f"Reaper: Worker {w_id} is dead. Last seen {now - last_seen}ms ago.")
                         w_data["status"] = "dead"
@@ -55,11 +60,23 @@ def run_reaper():
                             if job.attempts < job.max_retries:
                                 job.status = JobStatus.delayed
                                 requeue_with_backoff(job_id_str, worker_id, job.attempts)
-                                publish_job_event(job_id_str, JobStatus.delayed.value)
+                                publish_job_event(
+                                    job_id_str, 
+                                    JobStatus.delayed.value,
+                                    worker_id=worker_id,
+                                    attempts=job.attempts,
+                                    error=job.error
+                                )
                             else:
                                 job.status = JobStatus.dead_letter
                                 move_to_dead_letter(job_id_str, worker_id)
-                                publish_job_event(job_id_str, JobStatus.dead_letter.value)
+                                publish_job_event(
+                                    job_id_str, 
+                                    JobStatus.dead_letter.value,
+                                    worker_id=worker_id,
+                                    attempts=job.attempts,
+                                    error=job.error
+                                )
                             
                             db.commit()
                         else:

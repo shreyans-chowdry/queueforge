@@ -1,3 +1,6 @@
+import os
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -5,13 +8,15 @@ from sqlalchemy import text
 
 from api.routers import jobs, workers
 from api.websocket import router as ws_router, pubsub_listener
-from common.db import get_db
+from common.db import get_db, engine
+from common.models import Base
 from common.redis_client import redis_client
-from contextlib import asynccontextmanager
-import asyncio
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure database tables exist
+    Base.metadata.create_all(bind=engine)
+    
     # Startup: Start listening to Redis Pub/Sub for job events
     listener_task = asyncio.create_task(pubsub_listener())
     yield
@@ -24,10 +29,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="QueueForge API", lifespan=lifespan)
 
-# Allow CORS for the dashboard
+# Allow CORS for configured dashboard origins
+allowed_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

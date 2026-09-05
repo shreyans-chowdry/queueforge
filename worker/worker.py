@@ -5,7 +5,7 @@ import json
 import random
 import threading
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 
 from common.db import SessionLocal
 from common.models import Job, JobStatus
@@ -38,20 +38,23 @@ class Worker:
         """
         Executes the job based on its payload type.
         Supports demo tasks: sleep, compute, flaky.
+        Safely validates parameters to prevent unbounded stalls or DoS.
         """
         job_type = payload.get("type", "sleep")
         if job_type == "sleep":
-            time.sleep(payload.get("seconds", 1))
+            seconds = min(max(0.0, float(payload.get("seconds", 1))), 300.0)
+            time.sleep(seconds)
         elif job_type == "compute":
             # Simulate a CPU-bound calculation by hashing repeatedly
+            iterations = min(max(1, int(payload.get("iterations", 500_000))), 2_000_000)
             data = b"queueforge"
-            for _ in range(1_000_000):
+            for _ in range(iterations):
                 data = hashlib.sha256(data).digest()
         elif job_type == "flaky":
             # Exercise the retry path ~30% of the time
             if random.random() < 0.3:
                 raise Exception("Random flaky failure!")
-            time.sleep(0.5)
+            time.sleep(0.2)
         else:
             raise ValueError(f"Unknown job type: {job_type}")
 
@@ -86,10 +89,15 @@ class Worker:
 
                     # 3. Mark the job as processing
                     job.status = JobStatus.processing
-                    job.started_at = datetime.utcnow()
+                    job.started_at = datetime.now(timezone.utc)
                     job.worker_id = WORKER_ID
                     db.commit()
-                    publish_job_event(job_id_str, JobStatus.processing.value)
+                    publish_job_event(
+                        job_id_str, 
+                        JobStatus.processing.value,
+                        worker_id=WORKER_ID,
+                        attempts=job.attempts
+                    )
 
                     # 4. Execute the payload
                     try:
@@ -97,11 +105,16 @@ class Worker:
                         
                         # 5. On success: update DB, acknowledge, and broadcast
                         job.status = JobStatus.completed
-                        job.completed_at = datetime.utcnow()
+                        job.completed_at = datetime.now(timezone.utc)
                         db.commit()
                         
                         ack(job_id_str, WORKER_ID)
-                        publish_job_event(job_id_str, JobStatus.completed.value)
+                        publish_job_event(
+                            job_id_str, 
+                            JobStatus.completed.value,
+                            worker_id=WORKER_ID,
+                            attempts=job.attempts
+                        )
 
                     except Exception as e:
                         # 6. On exception: handle retries
@@ -110,21 +123,28 @@ class Worker:
                         
                         if job.attempts < job.max_retries:
                             # RETRY DECISION:
-                            # We haven't hit the retry limit yet. We use requeue_with_backoff 
-                            # to place the job back in the 'delayed' queue with an exponentially 
-                            # increasing delay. This prevents overwhelming the system or external 
-                            # APIs, giving transient errors a realistic window to resolve themselves.
+                            # Exponentially increasing delay
                             job.status = JobStatus.delayed
                             requeue_with_backoff(job_id_str, WORKER_ID, job.attempts)
-                            publish_job_event(job_id_str, JobStatus.delayed.value)
+                            publish_job_event(
+                                job_id_str, 
+                                JobStatus.delayed.value,
+                                worker_id=WORKER_ID,
+                                attempts=job.attempts,
+                                error=job.error
+                            )
                         else:
                             # EXHAUSTED RETRIES:
-                            # The job persistently failed and maxed out its attempts. 
-                            # We move it to the dead letter queue (DLQ) so it doesn't continually 
-                            # clog the active pipeline. Developers can inspect DLQ jobs later.
+                            # Move to dead letter queue
                             job.status = JobStatus.dead_letter
                             move_to_dead_letter(job_id_str, WORKER_ID)
-                            publish_job_event(job_id_str, JobStatus.dead_letter.value)
+                            publish_job_event(
+                                job_id_str, 
+                                JobStatus.dead_letter.value,
+                                worker_id=WORKER_ID,
+                                attempts=job.attempts,
+                                error=job.error
+                            )
                             
                         db.commit()
 

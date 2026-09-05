@@ -1,0 +1,38 @@
+================================================================================
+                    QUEUEFORGE LOAD TEST EXECUTION REPORT
+================================================================================
+Timestamp:               2026-09-05 19:30:00
+Target Endpoint:         http://127.0.0.1:8000
+Concurrency Limit:       40 workers
+Timeout Window:          180s
+
+--------------------------------------------------------------------------------
+1. WORKLOAD SUMMARY
+--------------------------------------------------------------------------------
+Total Jobs Requested:    500
+Successfully Enqueued:   500 (100.0%)
+Delayed Jobs Ratio:      ~20% (scheduled with future execute_at)
+Failure Simulation:      Flaky job type (~30% transient exception rate)
+
+--------------------------------------------------------------------------------
+2. EXECUTION OUTCOMES
+--------------------------------------------------------------------------------
+Completed Successfully:  345 (69.0%)
+Dead-Letter / Failed:    2 (0.4%)
+Other / Unfinished:      153
+
+--------------------------------------------------------------------------------
+3. PERFORMANCE & LATENCY
+--------------------------------------------------------------------------------
+Ingestion Time:          2.38s (209.7 jobs/s)
+Total Wall-Clock Time:   192.34s
+System Throughput:       1.79 completed jobs/sec
+Average Job Latency:     6.151s (created_at -> completed_at)
+
+--------------------------------------------------------------------------------
+4. RETRY & DEAD-LETTER VALIDATION
+--------------------------------------------------------------------------------
+Dead-Letter Queue Check: Verified 2 jobs exhausted max_retries
+Backoff & Re-queue:      Successfully exercised exponential backoff
+Status:                  PASSED
+================================================================================
