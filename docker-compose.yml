@@ -19,6 +19,7 @@ services:
     container_name: queueforge-redis
     ports:
       - "6380:6379"
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -62,6 +63,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
   worker:
@@ -72,6 +79,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-queueforge_user}:${POSTGRES_PASSWORD:-queueforge_pass}@postgres:5432/${POSTGRES_DB:-queueforge_db}
       REDIS_URL: redis://redis:6379/0
     depends_on:
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -90,6 +99,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-queueforge_user}:${POSTGRES_PASSWORD:-queueforge_pass}@postgres:5432/${POSTGRES_DB:-queueforge_db}
       REDIS_URL: redis://redis:6379/0
     depends_on:
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -110,7 +121,8 @@ services:
       NEXT_PUBLIC_API_URL: http://localhost:8000
       NEXT_PUBLIC_WS_URL: ws://localhost:8000
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

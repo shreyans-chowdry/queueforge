@@ -27,15 +27,19 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        disconnected = []
-        for connection in self.active_connections:
+        async def send(connection):
             try:
-                await connection.send_json(message)
+                await asyncio.wait_for(connection.send_json(message), timeout=2)
             except Exception:
-                disconnected.append(connection)
-        
-        for d in disconnected:
-            self.disconnect(d)
+                self.disconnect(connection)
+                try:
+                    await asyncio.wait_for(connection.close(), timeout=1)
+                except Exception:
+                    pass
+
+        # Snapshot the list: disconnects must not skip another client. A slow
+        # browser cannot block delivery to the rest of the fleet.
+        await asyncio.gather(*(send(connection) for connection in tuple(self.active_connections)))
 
 manager = ConnectionManager()
 
@@ -78,7 +82,7 @@ async def pubsub_listener():
             if pubsub:
                 try:
                     await pubsub.unsubscribe("job_events")
-                    await pubsub.close()
+                    await pubsub.aclose()
                 except Exception:
                     pass
             if redis_conn:

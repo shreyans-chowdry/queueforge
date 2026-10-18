@@ -5,14 +5,6 @@ from common.queue_engine import (
 )
 from common.redis_client import redis_client
 
-@pytest.fixture(autouse=True)
-def setup_teardown():
-    # Clean the database before tests
-    redis_client.flushdb()
-    yield
-    # Clean up after tests
-    redis_client.flushdb()
-
 def test_priority_dequeuing():
     # Enqueue a low priority job first
     enqueue("job_low", priority=1)
@@ -116,3 +108,49 @@ def test_atomic_dequeue_leasing():
     lease_score = redis_client.zscore(f"queue:processing:{worker_id}", "job_to_lease")
     assert lease_score is not None
     assert lease_score > get_now_ms() + 10000
+
+
+def test_lease_renewal_never_resurrects_expired_work():
+    from common.queue_engine import renew_lease
+    enqueue("long_job")
+    dequeue("worker", 30000)
+    assert renew_lease("long_job", "worker", 60000)
+    assert redis_client.zscore("queue:processing:worker", "long_job") > get_now_ms() + 50000
+    redis_client.zadd("queue:processing:worker", {"long_job": get_now_ms() - 1})
+    assert not renew_lease("long_job", "worker")
+    redis_client.zrem("queue:processing:worker", "long_job")
+    assert not renew_lease("long_job", "worker")
+
+
+def test_cancel_after_promotion_and_after_claim():
+    from common.queue_engine import cancel_queued_job
+    enqueue("promoted")
+    assert cancel_queued_job("promoted")
+    assert not dequeue("worker", 1000)
+    enqueue("claimed")
+    assert dequeue("worker", 1000) == "claimed"
+    assert not cancel_queued_job("claimed")
+    assert redis_client.zscore("queue:processing:worker", "claimed") is not None
+
+
+def test_concurrent_workers_claim_each_job_once():
+    from concurrent.futures import ThreadPoolExecutor
+    for index in range(50):
+        enqueue(f"job_{index}")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(pool.map(lambda index: dequeue(f"worker_{index}", 5000), range(80)))
+    claimed = [claim for claim in claims if claim is not None]
+    assert len(claimed) == len(set(claimed)) == 50
+
+
+def test_dead_letter_transition_is_idempotent_and_redrive_is_atomic():
+    from common.queue_engine import move_to_dead_letter, redrive_dead_letter
+    enqueue("failed", priority=9)
+    dequeue("worker", 30000)
+    move_to_dead_letter("failed", "worker")
+    move_to_dead_letter("failed", "worker")
+    assert redis_client.lrange("queue:dead_letter", 0, -1) == ["failed"]
+    assert redis_client.hget("jobs:priority", "failed") is None
+    redrive_dead_letter("failed", priority=9)
+    assert redis_client.llen("queue:dead_letter") == 0
+    assert dequeue("other", 30000) == "failed"
