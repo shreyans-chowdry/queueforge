@@ -54,7 +54,7 @@ test("dispatch once and surface failed actions", async ({ page }) => {
   const api = await mockApi(page);
   await page.goto("/");
   await page.getByRole("button", { name: "Re-drive" }).click();
-  await expect(page.getByRole("alert")).toContainText("already been claimed");
+  await expect(page.getByRole("main").getByRole("alert")).toContainText("already been claimed");
   await page.getByRole("button", { name: "Enqueue Task" }).click();
   const dialog = page.getByRole("dialog", { name: "Enqueue Background Task" });
   await expect(dialog).toBeVisible();
@@ -73,6 +73,7 @@ test("mobile layout fits the viewport and keyboard focus stays in the dialog", a
   await page.screenshot({ path: testInfo.outputPath("console-mobile.png"), fullPage: true });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole("button", { name: "Enqueue Task" }).click();
+  await expect(page.getByRole("dialog", { name: "Enqueue Background Task" })).toBeVisible();
   await page.keyboard.press("Shift+Tab");
   expect(await page.evaluate(() => document.activeElement?.closest("dialog") !== null)).toBe(true);
 });
@@ -81,6 +82,6 @@ test("API outage displays recovery guidance rather than a healthy empty queue", 
   await page.route("http://127.0.0.1:8000/**", (route) => route.fulfill({ headers: { "Access-Control-Allow-Origin": "*" }, status: 503, json: { detail: "Service unavailable" } }));
   await page.routeWebSocket("ws://127.0.0.1:8000/ws/jobs", () => {});
   await page.goto("/");
-  await expect(page.getByRole("alert")).toContainText("Could not refresh the console");
+  await expect(page.getByRole("main").getByRole("alert")).toContainText("Could not refresh the console");
   await expect(page.getByText("Waiting for the API to reconnect.")).toBeVisible();
 });
