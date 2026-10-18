@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import {
   Plus,
   RotateCw,
@@ -18,27 +18,8 @@ import {
   RefreshCw,
 } from "lucide-react";
 
-interface JobData {
-  id: string;
-  status: string;
-  priority: number;
-  attempts: number;
-  max_retries?: number;
-  worker_id: string | null;
-  created_at: string;
-  payload?: Record<string, unknown>;
-  error?: string | null;
-}
-
-interface WorkerData {
-  last_seen: number;
-  status: string;
-  current_job_id: string | null;
-}
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
-const WS_BASE =
-  process.env.NEXT_PUBLIC_WS_URL || API_BASE.replace(/^http/, "ws");
+import { JOB_LIMIT, JobData, request, useQueue } from "@/lib/queue";
+import { Modal } from "@/components/modal";
 
 const STATUS_CONFIG: Record<
   string,
@@ -96,18 +77,20 @@ const STATUS_CONFIG: Record<
 };
 
 export default function OpsConsole() {
-  const [mounted, setMounted] = useState<boolean>(false);
-  const [jobs, setJobs] = useState<JobData[]>([]);
-  const [workers, setWorkers] = useState<Record<string, WorkerData>>({});
-  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const { jobs, workers, wsConnected, loading, error, updatedAt, refresh } = useQueue();
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const selectedJob = jobs.find((job) => job.id === selectedJobId);
+
   const [now, setNow] = useState<number>(0);
-  const [flashingJobIds, setFlashingJobIds] = useState<Set<string>>(new Set());
+  const mounted = now > 0;
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
 
   // Search & Filter State
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [activeTab, setActiveTab] = useState<
-    "all" | "processing" | "pending" | "delayed" | "completed" | "dead_letter"
+    "all" | "processing" | "pending" | "delayed" | "completed" | "dead_letter" | "cancelled"
   >("all");
 
   // Modal State
@@ -119,148 +102,10 @@ export default function OpsConsole() {
   const [sleepDuration, setSleepDuration] = useState<number>(1);
   const [computeIterations, setComputeIterations] = useState<number>(500000);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  // Live timer tick every 1s for accurate IST time & last-seen calculations
   useEffect(() => {
-    setMounted(true);
-    setNow(Date.now());
-    const timer = setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-
-  // Fetch initial jobs
-  const fetchJobs = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/jobs?limit=150`);
-      if (res.ok) {
-        const data = await res.json();
-        setJobs(data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch jobs:", err);
-    }
-  }, []);
-
-  // Poll workers registry every 2.5s
-  const fetchWorkers = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/workers`);
-      if (res.ok) {
-        const data = await res.json();
-        setWorkers(data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch workers:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchJobs();
-    fetchWorkers();
-    const interval = setInterval(fetchWorkers, 2500);
-    return () => clearInterval(interval);
-  }, [fetchJobs, fetchWorkers]);
-
-  // Flash row helper
-  const triggerRowFlash = useCallback((jobId: string) => {
-    setFlashingJobIds((prev) => new Set(prev).add(jobId));
-    setTimeout(() => {
-      setFlashingJobIds((prev) => {
-        const next = new Set(prev);
-        next.delete(jobId);
-        return next;
-      });
-    }, 450);
-  }, []);
-
-  // WebSocket with instant in-memory patch
-  useEffect(() => {
-    let isMounted = true;
-
-    const connectWs = () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-
-      const ws = new WebSocket(`${WS_BASE}/ws/jobs`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!isMounted) return;
-        setWsConnected(true);
-      };
-
-      ws.onmessage = async (event) => {
-        if (!isMounted) return;
-        try {
-          const payload = JSON.parse(event.data);
-          const { job_id, status, worker_id, attempts, error } = payload;
-
-          if (job_id) {
-            triggerRowFlash(job_id);
-
-            setJobs((prev) => {
-              const idx = prev.findIndex((j) => j.id === job_id);
-              if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = {
-                  ...copy[idx],
-                  status: status || copy[idx].status,
-                  worker_id: worker_id !== undefined ? worker_id : copy[idx].worker_id,
-                  attempts:
-                    attempts !== undefined && attempts !== null
-                      ? attempts
-                      : copy[idx].attempts,
-                  error: error !== undefined ? error : copy[idx].error,
-                };
-                return copy;
-              }
-              // If not found in memory, query this single new job
-              fetch(`${API_BASE}/jobs/${job_id}`)
-                .then((r) => (r.ok ? r.json() : null))
-                .then((newJob) => {
-                  if (newJob && isMounted) {
-                    setJobs((cur) => {
-                      if (cur.some((item) => item.id === newJob.id)) return cur;
-                      return [newJob, ...cur];
-                    });
-                  }
-                })
-                .catch(() => {});
-              return prev;
-            });
-          }
-        } catch (err) {
-          console.error("WebSocket message parse error:", err);
-        }
-      };
-
-      ws.onerror = () => {
-        if (!isMounted) return;
-        setWsConnected(false);
-      };
-
-      ws.onclose = () => {
-        if (!isMounted) return;
-        setWsConnected(false);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (isMounted) connectWs();
-        }, 3000);
-      };
-    };
-
-    connectWs();
-
-    return () => {
-      isMounted = false;
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) wsRef.current.close();
-    };
-  }, [triggerRowFlash]);
 
   // Derived metrics
   const totalJobs = jobs.length;
@@ -274,7 +119,7 @@ export default function OpsConsole() {
 
   const workerEntries = Object.entries(workers);
   const activeWorkersCount = workerEntries.filter(
-    ([, w]) => w.status === "alive"
+    ([, w]) => w.status === "alive" && (!now || now - w.last_seen < 15000)
   ).length;
 
   // IST Time Formatter (Indian Standard Time, Asia/Kolkata)
@@ -309,7 +154,7 @@ export default function OpsConsole() {
   const formatTimestamp = (isoString: string) => {
     if (!mounted || !isoString) return "—";
     try {
-      const d = new Date(isoString.endsWith("Z") ? isoString : isoString + "Z");
+      const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(isoString) ? isoString : isoString + "Z");
       return d.toLocaleTimeString("en-IN", {
         timeZone: "Asia/Kolkata",
         hour12: false,
@@ -323,41 +168,18 @@ export default function OpsConsole() {
   };
 
   // Actions
-  const handleCancelJob = async (jobId: string) => {
+  const handleJobAction = async (jobId: string, action: "cancel" | "retry") => {
+    if (actionLoadingId) return;
     setActionLoadingId(jobId);
+    setActionError(null);
+    setNotice(null);
     try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}/cancel`, {
-        method: "POST",
-      });
-      if (res.ok) {
-        setJobs((prev) =>
-          prev.map((j) =>
-            j.id === jobId
-              ? { ...j, status: "cancelled", error: "Cancelled by user" }
-              : j
-          )
-        );
-      }
-    } catch (err) {
-      console.error("Cancel failed:", err);
+      await request(`/jobs/${jobId}/${action}`, { method: "POST" });
+      setNotice(action === "cancel" ? "Job cancelled." : "Job requeued with a fresh retry budget.");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Action failed. Please retry.");
     } finally {
-      setActionLoadingId(null);
-    }
-  };
-
-  const handleRetryJob = async (jobId: string) => {
-    setActionLoadingId(jobId);
-    try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}/retry`, {
-        method: "POST",
-      });
-      if (res.ok) {
-        const updated = await res.json();
-        setJobs((prev) => prev.map((j) => (j.id === jobId ? updated : j)));
-      }
-    } catch (err) {
-      console.error("Retry failed:", err);
-    } finally {
+      refresh();
       setActionLoadingId(null);
     }
   };
@@ -365,6 +187,8 @@ export default function OpsConsole() {
   const handleCreateJob = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
+    setActionError(null);
+    setNotice(null);
     try {
       let payload: Record<string, unknown> = { type: taskType };
       if (taskType === "sleep") {
@@ -380,23 +204,16 @@ export default function OpsConsole() {
         execute_at = new Date(Date.now() + taskDelaySec * 1000).toISOString();
       }
 
-      const res = await fetch(`${API_BASE}/jobs`, {
+      await request<JobData>("/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          payload,
-          priority: Number(taskPriority),
-          execute_at,
-        }),
+        body: JSON.stringify({ payload, priority: Number(taskPriority), execute_at }),
       });
-
-      if (res.ok) {
-        const newJob = await res.json();
-        setJobs((prev) => [newJob, ...prev]);
-        setIsModalOpen(false);
-      }
-    } catch (err) {
-      console.error("Submit task failed:", err);
+      setNotice("Task dispatched successfully.");
+      setIsModalOpen(false);
+      refresh();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to dispatch the task.");
     } finally {
       setSubmitting(false);
     }
@@ -409,6 +226,7 @@ export default function OpsConsole() {
       if (activeTab === "processing" && job.status !== "processing") return false;
       if (activeTab === "pending" && job.status !== "pending") return false;
       if (activeTab === "delayed" && job.status !== "delayed") return false;
+      if (activeTab === "cancelled" && job.status !== "cancelled") return false;
       if (activeTab === "completed" && job.status !== "completed") return false;
       if (
         activeTab === "dead_letter" &&
@@ -419,11 +237,11 @@ export default function OpsConsole() {
 
       // Search filter
       if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
+        const q = searchQuery.trim().toLowerCase();
         const matchesId = job.id.toLowerCase().includes(q);
         const matchesWorker = (job.worker_id || "").toLowerCase().includes(q);
         const matchesStatus = job.status.toLowerCase().includes(q);
-        return matchesId || matchesWorker || matchesStatus;
+        return matchesId || matchesWorker || matchesStatus || JSON.stringify(job.payload).toLowerCase().includes(q);
       }
 
       return true;
@@ -459,7 +277,7 @@ export default function OpsConsole() {
               <span className="text-sm font-bold tracking-wider uppercase text-white flex items-center gap-1.5">
                 <span className="text-[#06B6D4]">QUEUEFORGE</span>
                 <span className="text-slate-500 text-xs font-normal">
-                  // OPS CONTROL
+                  Ops control
                 </span>
               </span>
             </div>
@@ -483,7 +301,7 @@ export default function OpsConsole() {
 
             {/* Primary Action Button */}
             <button
-              onClick={() => setIsModalOpen(true)}
+              onClick={() => { setActionError(null); setIsModalOpen(true); }}
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-gradient-to-r from-[#06B6D4] to-[#3B82F6] hover:from-[#0891B2] hover:to-[#2563EB] text-white text-xs font-semibold rounded-md shadow-md shadow-cyan-500/10 hover:shadow-cyan-500/20 transition-all cursor-pointer transform active:scale-95"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -494,12 +312,12 @@ export default function OpsConsole() {
       </header>
 
       {/* Disconnect Alert */}
-      {!wsConnected && (
+      {!wsConnected && !loading && (
         <div className="bg-rose-950/40 border-b border-rose-500/30 px-6 py-2">
           <div className="max-w-[1440px] mx-auto flex items-center justify-between text-xs font-mono">
             <span className="text-rose-400 flex items-center gap-2">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
-              TELEMETRY STREAM OFFLINE // WebSocket stream to /ws/jobs disconnected. Reconnecting in 3s...
+              Live stream reconnecting. Jobs and workers refresh every 5 seconds.
             </span>
             <span className="text-rose-400/70">RETRYING AUTOMATICALLY</span>
           </div>
@@ -507,16 +325,30 @@ export default function OpsConsole() {
       )}
 
       {/* Main Mission Surface */}
-      <main className="max-w-[1440px] mx-auto px-6 py-6 space-y-6">
+      <main className="w-full max-w-[1440px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.2em] text-cyan-400 mb-2">QueueForge / Overview</p>
+            <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-white">Queue operations</h1>
+            <p className="mt-2 text-sm text-slate-400">Dispatch work, monitor your fleet, and recover failed tasks.</p>
+          </div>
+          <button onClick={refresh} className="inline-flex items-center gap-2 rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800">
+            <RotateCw className="h-3.5 w-3.5" /> Refresh
+          </button>
+        </div>
+        {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-950/30 p-4 text-sm text-rose-300">Could not refresh the console: {error}. {updatedAt ? "Showing the last successful snapshot." : "Check that the API is running."}</div>}
+        {actionError && !isModalOpen && <p role="alert" className="rounded-lg border border-rose-500/30 p-3 text-sm text-rose-300">{actionError}</p>}
+        {notice && <p role="status" className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-300">{notice}</p>}
+        <p className="text-xs text-slate-400">Metrics cover the latest {JOB_LIMIT} jobs. {updatedAt ? `Last synced ${formatISTClock(updatedAt)} IST.` : "Connecting to the API…"}</p>
         {/* Metric Cards - 4 Column Bento */}
         <section
           aria-label="Queue Metrics"
           className="grid grid-cols-2 lg:grid-cols-4 gap-3.5"
         >
-          {/* Total Ingested */}
+          {/* Recent jobs */}
           <div className="bg-[#121624] border border-[#1E2538] rounded-lg p-4 relative overflow-hidden group hover:border-[#2D374E] transition-colors">
             <div className="flex items-center justify-between text-slate-400 text-xs font-mono uppercase tracking-wider mb-2">
-              <span>Total Ingested</span>
+              <span>Recent jobs</span>
               <Layers className="w-4 h-4 text-slate-500" />
             </div>
             <div className="font-mono text-2xl font-bold text-white tracking-tight">
@@ -557,11 +389,11 @@ export default function OpsConsole() {
               {completedCount.toLocaleString()}
             </div>
             <div className="text-[11px] font-mono text-slate-500 mt-1">
-              Success Rate:{" "}
+              Completion share:{" "}
               <span className="text-slate-300 font-semibold">
                 {totalJobs > 0
                   ? ((completedCount / totalJobs) * 100).toFixed(1)
-                  : "100"}
+                  : "0"}
                 %
               </span>
             </div>
@@ -570,7 +402,7 @@ export default function OpsConsole() {
           {/* Dead Letter / DLQ */}
           <div className="bg-[#121624] border border-[#1E2538] rounded-lg p-4 relative overflow-hidden group hover:border-[#2D374E] transition-colors">
             <div className="flex items-center justify-between text-xs font-mono uppercase tracking-wider mb-2">
-              <span className="text-rose-400 font-semibold">Dead Letter (DLQ)</span>
+              <span className="text-rose-400 font-semibold">Needs attention</span>
               <AlertOctagon className="w-4 h-4 text-rose-400" />
             </div>
             <div className="font-mono text-2xl font-bold text-rose-400 tracking-tight flex items-baseline gap-2">
@@ -578,7 +410,7 @@ export default function OpsConsole() {
               <span className="text-xs text-slate-500 font-normal">failed</span>
             </div>
             <div className="text-[11px] font-mono text-slate-500 mt-1">
-              Max retries exhausted
+              Dead-lettered or failed to enqueue
             </div>
           </div>
         </section>
@@ -598,11 +430,11 @@ export default function OpsConsole() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {workerEntries.length === 0 ? (
               <div className="col-span-full bg-[#121624] border border-[#1E2538] rounded-lg p-6 text-center font-mono text-xs text-slate-500">
-                [ NO REGISTERED WORKERS ] // No active worker containers detected in workers:registry.
+                No workers connected. Start a worker to begin processing jobs.
               </div>
             ) : (
               workerEntries.map(([workerId, worker]) => {
-                const isAlive = worker.status === "alive";
+                const isAlive = worker.status === "alive" && (!now || now - worker.last_seen < 15000);
                 const isBusy = Boolean(worker.current_job_id);
 
                 return (
@@ -678,11 +510,13 @@ export default function OpsConsole() {
                 { key: "delayed", label: "Delayed", count: delayedCount },
                 { key: "completed", label: "Completed", count: completedCount },
                 { key: "dead_letter", label: "DLQ / Failed", count: dlqCount },
+                { key: "cancelled", label: "Cancelled", count: jobs.filter((job) => job.status === "cancelled").length },
               ].map((tab) => {
                 const isActive = activeTab === tab.key;
                 return (
                   <button
                     key={tab.key}
+                    aria-pressed={isActive}
                     onClick={() => setActiveTab(tab.key as typeof activeTab)}
                     className={`px-3 py-1 rounded text-xs font-mono transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
                       isActive
@@ -704,13 +538,14 @@ export default function OpsConsole() {
             </div>
 
             {/* Search Input */}
-            <div className="relative min-w-[240px]">
+            <div className="relative w-full sm:w-auto sm:min-w-[240px]">
               <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Filter by Job ID or Worker..."
+                aria-label="Search jobs by ID, worker, status, or payload"
+                placeholder="Search jobs or payload…"
                 className="w-full pl-8 pr-3 py-1 bg-[#0C0E14] border border-[#1E2538] rounded text-xs text-slate-200 font-mono focus:outline-none focus:border-[#06B6D4] transition-colors placeholder:text-slate-600"
               />
             </div>
@@ -720,6 +555,7 @@ export default function OpsConsole() {
           <div className="bg-[#121624] border border-[#1E2538] rounded-lg overflow-hidden shadow-sm">
             <div className="overflow-x-auto max-h-[640px] overflow-y-auto">
               <table className="w-full text-left border-collapse">
+                <caption className="sr-only">Latest jobs with status, priority, failed attempts, assigned worker, and actions</caption>
                 <thead className="sticky top-0 bg-[#0F121C] border-b border-[#1E2538] z-10 text-[11px] font-mono uppercase tracking-wider text-slate-400">
                   <tr>
                     <th scope="col" className="px-4 py-2.5 whitespace-nowrap">
@@ -732,7 +568,7 @@ export default function OpsConsole() {
                       Priority
                     </th>
                     <th scope="col" className="px-4 py-2.5 text-right">
-                      Attempts
+                      Failures
                     </th>
                     <th scope="col" className="px-4 py-2.5 whitespace-nowrap">
                       Worker ID
@@ -746,13 +582,13 @@ export default function OpsConsole() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1E2538]/60 text-xs font-mono">
-                  {filteredJobs.length === 0 ? (
+                  {loading ? <tr><td colSpan={7} className="p-10 text-center text-sm text-slate-400">Loading queue activity…</td></tr> : filteredJobs.length === 0 ? (
                     <tr>
                       <td
                         colSpan={7}
                         className="px-4 py-16 text-center text-slate-500 font-mono text-xs"
                       >
-                        [ NO MATCHING JOBS ]
+                        {jobs.length ? "No jobs match these filters. Try another status or search." : error ? "Waiting for the API to reconnect." : "Your queue is clear. Enqueue a task to get started."}
                         <div className="text-slate-600 text-[11px] mt-1">
                           No jobs found matching the current filter. Enqueue a task to begin.
                         </div>
@@ -761,7 +597,7 @@ export default function OpsConsole() {
                   ) : (
                     filteredJobs.map((job) => {
                       const cfg = STATUS_CONFIG[job.status] || STATUS_CONFIG.pending;
-                      const isFlashing = flashingJobIds.has(job.id);
+
                       const isActionLoading = actionLoadingId === job.id;
 
                       const canCancel =
@@ -774,16 +610,13 @@ export default function OpsConsole() {
                       return (
                         <tr
                           key={job.id}
-                          tabIndex={0}
-                          className={`hover:bg-[#181E30] transition-colors duration-150 ${
-                            isFlashing ? "bg-cyan-500/15" : ""
-                          }`}
+                          className="hover:bg-[#181E30] transition-colors duration-150"
                         >
                           {/* ID */}
                           <td className="px-4 py-2.5 text-slate-200 font-mono whitespace-nowrap">
-                            <span className="text-slate-100 font-semibold" title={job.id}>
+                            <button onClick={() => setSelectedJobId(job.id)} className="text-cyan-300 font-semibold underline decoration-cyan-800 underline-offset-4" aria-label={`Inspect job ${job.id}`} title={job.id}>
                               {job.id.slice(0, 8)}
-                            </span>
+                            </button>
                             <span className="text-slate-600">{job.id.slice(8, 14)}...</span>
                           </td>
 
@@ -847,8 +680,8 @@ export default function OpsConsole() {
                           <td className="px-4 py-2.5 text-center whitespace-nowrap">
                             {canCancel && (
                               <button
-                                onClick={() => handleCancelJob(job.id)}
-                                disabled={isActionLoading}
+                                onClick={() => handleJobAction(job.id, "cancel")}
+                                disabled={actionLoadingId !== null}
                                 className="text-[10px] px-2 py-0.5 rounded border border-rose-500/30 text-rose-400 hover:bg-rose-500/10 disabled:opacity-50 cursor-pointer font-mono"
                               >
                                 {isActionLoading ? "..." : "Cancel"}
@@ -856,8 +689,8 @@ export default function OpsConsole() {
                             )}
                             {canRetry && (
                               <button
-                                onClick={() => handleRetryJob(job.id)}
-                                disabled={isActionLoading}
+                                onClick={() => handleJobAction(job.id, "retry")}
+                                disabled={actionLoadingId !== null}
                                 className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/10 disabled:opacity-50 cursor-pointer font-mono font-medium"
                               >
                                 <RefreshCw className="w-2.5 h-2.5" />
@@ -886,8 +719,8 @@ export default function OpsConsole() {
 
       {/* Interactive Enqueue Task Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#121624] border border-[#1E2538] rounded-xl w-full max-w-md p-6 space-y-5 shadow-2xl shadow-black/80 animate-in fade-in zoom-in-95 duration-150">
+        <Modal onClose={() => setIsModalOpen(false)} labelledBy="enqueue-title">
+          <div className="bg-[#121624] border border-[#1E2538] rounded-xl w-full p-6 space-y-5 shadow-2xl shadow-black/80 animate-in fade-in zoom-in-95 duration-150">
             {/* Modal Header */}
             <div className="flex items-center justify-between border-b border-[#1E2538] pb-3">
               <div className="flex items-center gap-2">
@@ -895,7 +728,7 @@ export default function OpsConsole() {
                   <Plus className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-sm text-white">Enqueue Background Task</h3>
+                  <h3 id="enqueue-title" className="font-bold text-sm text-white">Enqueue Background Task</h3>
                   <p className="text-[11px] text-slate-500 font-mono">
                     Dispatch workload into QueueForge engine
                   </p>
@@ -903,6 +736,7 @@ export default function OpsConsole() {
               </div>
               <button
                 onClick={() => setIsModalOpen(false)}
+                aria-label="Close enqueue dialog"
                 className="text-slate-500 hover:text-slate-200 transition-colors p-1"
               >
                 <X className="w-4 h-4" />
@@ -910,6 +744,7 @@ export default function OpsConsole() {
             </div>
 
             <form onSubmit={handleCreateJob} className="space-y-4">
+              {actionError && <p role="alert" className="text-sm text-rose-300">{actionError}</p>}
               {/* Task Type selector */}
               <div className="space-y-1.5">
                 <label className="text-[11px] font-mono uppercase text-slate-400 font-semibold">
@@ -919,6 +754,7 @@ export default function OpsConsole() {
                   <button
                     type="button"
                     onClick={() => setTaskType("sleep")}
+                    aria-pressed={taskType === "sleep"}
                     className={`flex flex-col items-center justify-center p-2.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
                       taskType === "sleep"
                         ? "border-[#06B6D4] bg-cyan-500/15 text-cyan-300 font-bold shadow-sm shadow-cyan-500/20"
@@ -932,6 +768,7 @@ export default function OpsConsole() {
                   <button
                     type="button"
                     onClick={() => setTaskType("compute")}
+                    aria-pressed={taskType === "compute"}
                     className={`flex flex-col items-center justify-center p-2.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
                       taskType === "compute"
                         ? "border-[#06B6D4] bg-cyan-500/15 text-cyan-300 font-bold shadow-sm shadow-cyan-500/20"
@@ -945,6 +782,7 @@ export default function OpsConsole() {
                   <button
                     type="button"
                     onClick={() => setTaskType("flaky")}
+                    aria-pressed={taskType === "flaky"}
                     className={`flex flex-col items-center justify-center p-2.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
                       taskType === "flaky"
                         ? "border-rose-500 bg-rose-500/15 text-rose-300 font-bold shadow-sm shadow-rose-500/20"
@@ -966,6 +804,7 @@ export default function OpsConsole() {
                   </div>
                   <input
                     type="range"
+                    aria-label="Sleep duration in seconds"
                     min="0.5"
                     max="10"
                     step="0.5"
@@ -986,6 +825,7 @@ export default function OpsConsole() {
                   </div>
                   <input
                     type="range"
+                    aria-label="Compute iterations"
                     min="100000"
                     max="1500000"
                     step="100000"
@@ -1020,6 +860,7 @@ export default function OpsConsole() {
                 </div>
                 <input
                   type="range"
+                  aria-label="Job priority"
                   min="1"
                   max="10"
                   value={taskPriority}
@@ -1043,6 +884,7 @@ export default function OpsConsole() {
                 </div>
                 <input
                   type="range"
+                  aria-label="Schedule delay in seconds"
                   min="0"
                   max="30"
                   step="5"
@@ -1076,8 +918,24 @@ export default function OpsConsole() {
               </div>
             </form>
           </div>
-        </div>
+        </Modal>
       )}
+      {selectedJob && <Modal labelledBy="job-title" onClose={() => setSelectedJobId(null)}>
+        <div className="p-6 space-y-5">
+          <div className="flex items-center justify-between gap-3">
+            <h2 id="job-title" className="text-lg font-semibold text-white">Job details</h2>
+            <button aria-label="Close job details" onClick={() => setSelectedJobId(null)} className="p-2 hover:bg-slate-800 rounded"><X className="h-4 w-4" /></button>
+          </div>
+          <p className="break-all font-mono text-xs text-cyan-300">{selectedJob.id}</p>
+          <dl className="grid grid-cols-2 gap-4 text-xs">
+            {Object.entries({ Status: selectedJob.status, Priority: selectedJob.priority, Failures: `${selectedJob.attempts}/${selectedJob.max_retries}`, Worker: selectedJob.worker_id || "Unassigned", Created: formatTimestamp(selectedJob.created_at), Scheduled: selectedJob.scheduled_at ? formatTimestamp(selectedJob.scheduled_at) : "Immediate", Started: selectedJob.started_at ? formatTimestamp(selectedJob.started_at) : "—", Finished: selectedJob.completed_at ? formatTimestamp(selectedJob.completed_at) : "—" }).map(([label, value]) => <div key={label}><dt className="text-slate-400 mb-1">{label}</dt><dd className="break-all">{value}</dd></div>)}
+          </dl>
+          {selectedJob.error && <div className="rounded border border-rose-500/30 bg-rose-500/5 p-3 text-sm text-rose-300 break-words">{selectedJob.error}</div>}
+          <div><h3 className="text-xs font-semibold text-slate-400 mb-2">Payload</h3><pre className="overflow-auto rounded-lg bg-[#0C0E14] p-4 text-xs text-slate-300">{JSON.stringify(selectedJob.payload, null, 2)}</pre></div>
+          {selectedJob.result && <div><h3 className="text-xs font-semibold text-slate-400 mb-2">Result</h3><pre className="overflow-auto rounded-lg bg-[#0C0E14] p-4 text-xs">{JSON.stringify(selectedJob.result, null, 2)}</pre></div>}
+          <p className="text-xs text-slate-500">All times are shown in IST.</p>
+        </div>
+      </Modal>}
     </div>
   );
 }

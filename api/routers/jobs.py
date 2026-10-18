@@ -1,3 +1,5 @@
+import logging
+import math
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from sqlalchemy.orm import Session
@@ -7,10 +9,23 @@ import uuid
 
 from common.db import get_db
 from common.models import Job, JobStatus
-from common.queue_engine import enqueue, publish_job_event, redrive_dead_letter, get_dlq_jobs
+from common.queue_engine import enqueue, publish_job_event, redrive_dead_letter, get_dlq_jobs, cancel_queued_job
 from common.redis_client import redis_client
+from redis.exceptions import RedisError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+def emit_event(job_id, status):
+    # Telemetry is best effort: never report a committed action as failed solely
+    # because the Pub/Sub connection dropped. Polling reconciles the dashboard.
+    try:
+        publish_job_event(job_id, status)
+    except RedisError:
+        logger.exception("Could not publish job event for %s", job_id)
+
 
 class JobCreate(BaseModel):
     payload: Dict[str, Any]
@@ -22,11 +37,29 @@ class JobCreate(BaseModel):
     def validate_payload(cls, v: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(v, dict):
             raise ValueError("Payload must be a dictionary")
-        job_type = v.get("type")
+        def validate_json(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("Payload numbers must be finite")
+            if isinstance(value, dict):
+                for item in value.values():
+                    validate_json(item)
+            elif isinstance(value, list):
+                for item in value:
+                    validate_json(item)
+        validate_json(v)
+        job_type = v.get("type", "sleep")
+        if job_type not in ("sleep", "compute", "flaky"):
+            raise ValueError("Job type must be sleep, compute, or flaky")
         if job_type == "sleep":
             sec = v.get("seconds", 1)
-            if not isinstance(sec, (int, float)) or sec < 0 or sec > 300:
-                raise ValueError("Sleep seconds must be a number between 0 and 300")
+            if (isinstance(sec, bool) or not isinstance(sec, (int, float))
+                    or not 0 <= sec <= 300):
+                raise ValueError("Sleep seconds must be a finite number between 0 and 300")
+        elif job_type == "compute":
+            iterations = v.get("iterations", 500_000)
+            if (isinstance(iterations, bool) or not isinstance(iterations, int)
+                    or not 1 <= iterations <= 2_000_000):
+                raise ValueError("Compute iterations must be an integer between 1 and 2000000")
         return v
 
 class JobResponse(BaseModel):
@@ -67,7 +100,7 @@ def create_job(job_in: JobCreate, db: Session = Depends(get_db)):
     new_job = Job(
         payload=job_in.payload,
         priority=job_in.priority,
-        scheduled_at=job_in.execute_at,
+        scheduled_at=exec_time if job_in.execute_at else None,
         status=initial_status
     )
     db.add(new_job)
@@ -75,8 +108,15 @@ def create_job(job_in: JobCreate, db: Session = Depends(get_db)):
     db.refresh(new_job)
     
     # Enqueue in Redis
-    enqueue(str(new_job.id), new_job.priority, execute_at_ms)
-    publish_job_event(str(new_job.id), initial_status.value)
+    try:
+        enqueue(str(new_job.id), new_job.priority, execute_at_ms)
+    except RedisError:
+        # Keep an inspectable, retryable record instead of an invisible stranded job.
+        new_job.status = JobStatus.failed
+        new_job.error = "Queue unavailable during submission. Retry this job when Redis is healthy."
+        db.commit()
+        raise HTTPException(status_code=503, detail={"message": new_job.error, "job_id": str(new_job.id)})
+    emit_event(str(new_job.id), initial_status.value)
     
     return new_job
 
@@ -85,9 +125,9 @@ def get_dead_letter_queue():
     """
     Returns all job IDs currently in the Dead Letter Queue.
     """
-    dlq_ids = get_dlq_jobs(0, 100)
+    dlq_ids = get_dlq_jobs(0, 99)
     return {
-        "count": len(dlq_ids),
+        "count": redis_client.llen("queue:dead_letter"),
         "job_ids": dlq_ids
     }
 
@@ -102,17 +142,18 @@ def get_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
 def list_jobs(
     status: Optional[JobStatus] = None, 
     limit: int = Query(default=100, ge=1, le=500), 
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db)
 ):
     query = db.query(Job)
     if status:
         query = query.filter(Job.status == status)
-    jobs = query.order_by(Job.created_at.desc()).limit(limit).all()
+    jobs = query.order_by(Job.created_at.desc(), Job.id.desc()).offset(offset).limit(limit).all()
     return jobs
 
 @router.post("/{job_id}/cancel")
 def cancel_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.id == job_id).first()
+    job = db.query(Job).filter(Job.id == job_id).with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
         
@@ -122,17 +163,13 @@ def cancel_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
             detail=f"Cannot cancel job in status: {job.status.value}"
         )
         
-    # Remove from Redis
-    if job.status == JobStatus.pending:
-        redis_client.zrem("queue:pending", str(job.id))
-    elif job.status == JobStatus.delayed:
-        redis_client.zrem("queue:delayed", str(job.id))
-        
-    redis_client.hdel("jobs:priority", str(job.id))
+    if not cancel_queued_job(str(job.id)):
+        raise HTTPException(status_code=409, detail="Job has already been claimed. Refresh its status.")
     job.status = JobStatus.cancelled
     job.error = "Cancelled by user"
+    job.completed_at = datetime.now(timezone.utc)
     db.commit()
-    publish_job_event(str(job.id), JobStatus.cancelled.value)
+    emit_event(str(job.id), JobStatus.cancelled.value)
     
     return {"message": "Job cancelled successfully"}
 
@@ -141,7 +178,7 @@ def retry_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     Re-drives a failed, dead-lettered, or cancelled job back into the active queue.
     """
-    job = db.query(Job).filter(Job.id == job_id).first()
+    job = db.query(Job).filter(Job.id == job_id).with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -151,9 +188,6 @@ def retry_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
             detail=f"Cannot retry job in status: {job.status.value}. Only dead_letter, failed, or cancelled jobs can be retried."
         )
 
-    # Re-drive from DLQ if present, or enqueue to pending
-    redrive_dead_letter(str(job.id), priority=job.priority)
-
     # Reset job state in Postgres
     job.status = JobStatus.pending
     job.attempts = 0
@@ -161,8 +195,17 @@ def retry_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job.started_at = None
     job.completed_at = None
     job.worker_id = None
+    job.scheduled_at = None
+    job.result = None
     db.commit()
     db.refresh(job)
 
-    publish_job_event(str(job.id), JobStatus.pending.value)
+    try:
+        redrive_dead_letter(str(job.id), priority=job.priority)
+    except RedisError:
+        job.status = JobStatus.failed
+        job.error = "Queue unavailable during retry. Try again when Redis is healthy."
+        db.commit()
+        raise HTTPException(status_code=503, detail=job.error)
+    emit_event(str(job.id), JobStatus.pending.value)
     return job

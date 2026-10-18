@@ -25,3 +25,9 @@ yarn-error.log
 *.swo
 .agents/
 
+.venv/
+npm-audit-*.json
+
+# Browser test artifacts
+dashboard/playwright-report/
+dashboard/test-results/

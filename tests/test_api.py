@@ -153,3 +153,88 @@ async def test_list_jobs_limit_validation(client):
 
     resp_excessive = await client.get("/jobs?limit=1000")
     assert resp_excessive.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("payload", [
+    {"type": "unknown"}, {"type": "sleep", "seconds": True},
+    {"type": "compute", "iterations": "100"},
+    {"type": "compute", "iterations": 1.5},
+    {"type": "compute", "iterations": 2000001},
+    {"type": "compute", "iterations": False},
+])
+async def test_reject_unsupported_payloads(client, payload):
+    assert (await client.post("/jobs", json={"payload": payload})).status_code == 422
+
+
+@pytest.mark.anyio
+async def test_cancel_cannot_race_a_worker_claim(client):
+    from common.queue_engine import dequeue
+    job_id = (await client.post("/jobs", json={"payload": {"type": "sleep"}})).json()["id"]
+    assert dequeue("racing_worker", 30000) == job_id
+    response = await client.post(f"/jobs/{job_id}/cancel")
+    assert response.status_code == 409
+    assert (await client.get(f"/jobs/{job_id}")).json()["status"] != "cancelled"
+
+
+@pytest.mark.anyio
+async def test_cancel_after_delayed_job_was_promoted(client):
+    from common.queue_engine import promote_due_delayed_jobs, get_now_ms
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    job_id = (await client.post("/jobs", json={"payload": {"type": "sleep"}, "execute_at": future})).json()["id"]
+    redis_client.zadd("queue:delayed", {job_id: get_now_ms() - 1})
+    promote_due_delayed_jobs()
+    assert (await client.post(f"/jobs/{job_id}/cancel")).status_code == 200
+    assert redis_client.zscore("queue:pending", job_id) is None
+
+
+@pytest.mark.anyio
+async def test_enqueue_outage_is_visible_and_retryable(client, monkeypatch):
+    from redis.exceptions import ConnectionError
+    import api.routers.jobs as routes
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("private connection details")
+    with monkeypatch.context() as patch:
+        patch.setattr(routes, "enqueue", unavailable)
+        response = await client.post("/jobs", json={"payload": {"type": "sleep"}})
+    assert response.status_code == 503
+    job_id = response.json()["detail"]["job_id"]
+    assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "failed"
+    assert "private" not in response.text
+    assert (await client.post(f"/jobs/{job_id}/retry")).json()["status"] == "pending"
+
+
+@pytest.mark.anyio
+async def test_pubsub_outage_does_not_fail_committed_submission(client, monkeypatch):
+    from redis.exceptions import ConnectionError
+    import api.routers.jobs as routes
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("pubsub down")
+    monkeypatch.setattr(routes, "publish_job_event", unavailable)
+    response = await client.post("/jobs", json={"payload": {"type": "sleep"}})
+    assert response.status_code == 201
+    assert redis_client.zscore("queue:pending", response.json()["id"]) is not None
+
+
+@pytest.mark.anyio
+async def test_list_jobs_offset_and_dlq_total(client):
+    ids = []
+    for _ in range(3):
+        ids.append((await client.post("/jobs", json={"payload": {"type": "sleep"}})).json()["id"])
+    first = (await client.get("/jobs?limit=2")).json()
+    second = (await client.get("/jobs?limit=2&offset=2")).json()
+    assert len(first) == 2 and len(second) == 1
+    assert {job["id"] for job in first + second} == set(ids)
+    assert (await client.get("/jobs?offset=-1")).status_code == 422
+    redis_client.rpush("queue:dead_letter", *[str(uuid.uuid4()) for _ in range(105)])
+    dlq = (await client.get("/jobs/dlq")).json()
+    assert dlq["count"] == 105 and len(dlq["job_ids"]) == 100
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+async def test_nonfinite_numbers_return_validation_errors_not_500(client, value):
+    response = await client.post("/jobs", content='{"payload":{"type":"sleep","seconds":' + value + '}}', headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    nested = await client.post("/jobs", content='{"payload":{"type":"compute","metadata":[' + value + ']}}', headers={"Content-Type": "application/json"})
+    assert nested.status_code == 422

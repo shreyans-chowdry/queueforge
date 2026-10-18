@@ -54,13 +54,40 @@ def enqueue(job_id: str, priority: int = 5, execute_at: int = None):
     """
     now = get_now_ms()
     # Retain priority in hash so delayed promotions & retries preserve original priority
-    redis_client.hset("jobs:priority", job_id, priority)
+    pipe = redis_client.pipeline()
+    pipe.hset("jobs:priority", job_id, priority)
     
     if execute_at and execute_at > now:
-        redis_client.zadd("queue:delayed", {job_id: execute_at})
+        pipe.zadd("queue:delayed", {job_id: execute_at})
     else:
         score = (10 - priority) * (10**13) + now
-        redis_client.zadd("queue:pending", {job_id: score})
+        pipe.zadd("queue:pending", {job_id: score})
+    pipe.execute()
+
+
+def cancel_queued_job(job_id: str) -> bool:
+    """Remove either queued state atomically; a claimed job cannot be cancelled."""
+    return bool(redis_client.eval("""
+        local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+                      + redis.call('ZREM', KEYS[2], ARGV[1])
+        if removed > 0 then
+            redis.call('HDEL', KEYS[3], ARGV[1])
+        end
+        return removed
+    """, 3, "queue:pending", "queue:delayed", "jobs:priority", job_id))
+
+
+def renew_lease(job_id: str, worker_id: str, visibility_timeout_ms: int = 30000) -> bool:
+    """Extend a live lease only. Expired or recovered jobs cannot be resurrected."""
+    now = get_now_ms()
+    return bool(redis_client.eval("""
+        local expiry = redis.call('ZSCORE', KEYS[1], ARGV[1])
+        if expiry and tonumber(expiry) > tonumber(ARGV[2]) then
+            redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+            return 1
+        end
+        return 0
+    """, 1, f"queue:processing:{worker_id}", job_id, now, now + visibility_timeout_ms))
 
 def promote_due_delayed_jobs() -> int:
     """
@@ -105,19 +132,24 @@ def ack(job_id: str, worker_id: str):
     pipe.hdel("jobs:priority", job_id)
     pipe.execute()
 
-def requeue_with_backoff(job_id: str, worker_id: str, attempt: int, base_delay_ms: int = 1000, max_delay_ms: int = 60000):
+def retry_at_ms(attempt: int, base_delay_ms: int = 1000, max_delay_ms: int = 60000) -> int:
+    delay = min(max_delay_ms, base_delay_ms * (2 ** min(attempt, 30)))
+    jitter = random.randint(0, delay // 2) if delay > 0 else 0
+    return get_now_ms() + min(max_delay_ms, delay + jitter)
+
+
+def requeue_with_backoff(job_id: str, worker_id: str, attempt: int, base_delay_ms: int = 1000, max_delay_ms: int = 60000, execute_at: int = None):
     """
     Removes the job from the processing queue and schedules it for a retry with exponential backoff.
     This limits the rate of retries for failing jobs, allowing transient issues time to resolve.
     """
-    redis_client.zrem(f"queue:processing:{worker_id}", job_id)
-    
-    delay = min(max_delay_ms, base_delay_ms * (2 ** attempt))
-    jitter = random.randint(0, delay // 2) if delay > 0 else 0
-    total_delay = delay + jitter
-    
-    execute_at = get_now_ms() + total_delay
-    redis_client.zadd("queue:delayed", {job_id: execute_at})
+    if execute_at is None:
+        execute_at = retry_at_ms(attempt, base_delay_ms, max_delay_ms)
+    pipe = redis_client.pipeline()
+    pipe.zrem(f"queue:processing:{worker_id}", job_id)
+    pipe.zadd("queue:delayed", {job_id: execute_at})
+    pipe.execute()
+    return execute_at
 
 def move_to_dead_letter(job_id: str, worker_id: str):
     """
@@ -126,15 +158,21 @@ def move_to_dead_letter(job_id: str, worker_id: str):
     """
     pipe = redis_client.pipeline()
     pipe.zrem(f"queue:processing:{worker_id}", job_id)
+    pipe.lrem("queue:dead_letter", 0, job_id)
     pipe.rpush("queue:dead_letter", job_id)
+    pipe.hdel("jobs:priority", job_id)
     pipe.execute()
 
 def redrive_dead_letter(job_id: str, priority: int = 5):
     """
     Re-enqueues a job from the dead letter queue back into the active pending queue.
     """
-    redis_client.lrem("queue:dead_letter", 0, job_id)
-    enqueue(job_id, priority=priority)
+    pipe = redis_client.pipeline()
+    pipe.lrem("queue:dead_letter", 0, job_id)
+    pipe.zrem("queue:delayed", job_id)
+    pipe.hset("jobs:priority", job_id, priority)
+    pipe.zadd("queue:pending", {job_id: (10 - priority) * 10**13 + get_now_ms()})
+    pipe.execute()
 
 def get_dlq_jobs(start: int = 0, stop: int = -1) -> List[str]:
     """Returns job IDs currently residing in the dead letter queue."""
